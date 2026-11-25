@@ -373,11 +373,16 @@ final class MetalBackedView: UIView {
     private var tmGestureDownPoint = CGPoint.zero
     private var tmPeak = 0
     private var tmResolved = false
+    /// A stack-transfer/furniture-pickup long press completed without a held
+    /// mouse button. It still consumes the gesture until every finger lifts.
+    private var tmSpecialResolved = false
     private var tmDragTouch: UITouch?
     private var tmSlopBroken = false
     private var tmGeneration = 0
     private var tmTwoFingerLastY: CGFloat = 0
     private var tmScrollAccum: CGFloat = 0
+    private var furnitureTapTime: TimeInterval = 0
+    private var furnitureTapPoint = CGPoint.zero
     private static let tmHoldDelay: TimeInterval = 0.25
     private static let tmSlop: CGFloat = 10
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
@@ -389,6 +394,7 @@ final class MetalBackedView: UIView {
         tmGestureDownPoint = .zero
         tmPeak = 0
         tmResolved = false
+        tmSpecialResolved = false
         tmDragTouch = nil
         tmSlopBroken = false
         tmGeneration += 1
@@ -420,6 +426,24 @@ final class MetalBackedView: UIView {
         postSurfacePointer(x, y, up | F_ABS)
     }
 
+    /// Furniture placement deliberately waits for a double tap. The first tap
+    /// only positions the furniture; the second emits one left click and exits
+    /// placement mode, avoiding the game's Q/WASD placement path entirely.
+    private func tmFurnitureTap(at p: CGPoint) {
+        let now = Date().timeIntervalSinceReferenceDate
+        if now - furnitureTapTime < 0.42,
+           hypot(p.x - furnitureTapPoint.x, p.y - furnitureTapPoint.y) < 52 {
+            tmAbsoluteClick(down: F_LDOWN, up: F_LUP, at: p)
+            furnitureTapTime = 0
+            TravellersTouchMode.shared.placedFurniture()
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        } else {
+            furnitureTapTime = now
+            furnitureTapPoint = p
+            UISelectionFeedbackGenerator().selectionChanged()
+        }
+    }
+
     private func touchModeBegan(_ touches: Set<UITouch>) {
         guard !tmResolved else { return }   // a finger joining mid-drag changes nothing
         for t in touches where tmDownPoints[ObjectIdentifier(t)] == nil {
@@ -430,11 +454,36 @@ final class MetalBackedView: UIView {
             tmGestureDownPoint = t.location(in: self)
             let (x, y) = mapPoint(tmGestureDownPoint)
             winios_cursor_move(x, y)
+            // A carried furniture item follows the cursor immediately. No
+            // button is held: dragging only positions it and double tap places.
+            if TravellersTouchMode.shared.furnitureHeld {
+                tmGeneration += 1
+                return
+            }
             tmGeneration += 1
             let gen = tmGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.tmHoldDelay) { [weak self, weak t] in
                 guard let self, let t, self.tmGeneration == gen, !self.tmResolved,
                       self.tmDownPoints.count == 1 else { return }
+                let special = TravellersTouchMode.shared
+                if special.stackTransfer {
+                    self.tmResolved = true
+                    self.tmSpecialResolved = true
+                    self.tmAbsoluteClick(down: self.F_RDOWN, up: self.F_RUP,
+                                         at: self.tmGestureDownPoint)
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    return
+                }
+                if special.decoration && !special.furnitureHeld {
+                    self.tmResolved = true
+                    self.tmSpecialResolved = true
+                    self.tmAbsoluteClick(down: self.F_RDOWN, up: self.F_RUP,
+                                         at: self.tmGestureDownPoint)
+                    special.pickedUpFurniture()
+                    self.furnitureTapTime = 0
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    return
+                }
                 self.tmCommitDrag(t)
             }
         } else {
@@ -445,6 +494,15 @@ final class MetalBackedView: UIView {
 
     private func touchModeMoved(_ touches: Set<UITouch>, _ event: UIEvent?) {
         let active = activeTouches(event)
+        if TravellersTouchMode.shared.furnitureHeld {
+            guard active.count == 1, let t = touches.first,
+                  let down = tmDownPoints[ObjectIdentifier(t)] else { return }
+            let p = t.location(in: self)
+            if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop { tmSlopBroken = true }
+            let (x, y) = mapPoint(p)
+            winios_cursor_move(x, y)
+            return
+        }
         if !tmResolved, tmDownPoints.count == 2, active.count == 2 {
             let avg = avgPoint(active)
             if tmTwoFingerLastY == 0 { tmTwoFingerLastY = avg.y }
@@ -482,6 +540,18 @@ final class MetalBackedView: UIView {
     }
 
     private func touchModeEnded(_ touches: Set<UITouch>, _ event: UIEvent?) {
+        if tmResolved, tmSpecialResolved {
+            if activeTouches(event).isEmpty { tmResetGesture() }
+            return
+        }
+        if TravellersTouchMode.shared.furnitureHeld {
+            guard activeTouches(event).isEmpty else { return }
+            let p = touches.first?.location(in: self) ?? tmGestureDownPoint
+            let moved = tmSlopBroken
+            tmResetGesture()
+            if !moved { tmFurnitureTap(at: p) }
+            return
+        }
         if tmResolved, let d = tmDragTouch, touches.contains(d) {
             let (x, y) = mapPoint(d.location(in: self))
             postSurfaceTouchUp(x, y)
@@ -505,6 +575,10 @@ final class MetalBackedView: UIView {
     }
 
     private func touchModeCancelled(_ touches: Set<UITouch>) {
+        if tmSpecialResolved || TravellersTouchMode.shared.furnitureHeld {
+            tmResetGesture()
+            return
+        }
         if tmResolved, let d = tmDragTouch, touches.contains(d) {
             let (x, y) = mapPoint(d.location(in: self))
             postSurfaceTouchUp(x, y)   // never leave the button held
@@ -3976,6 +4050,11 @@ enum ControlAction: Codable, Equatable, Hashable {
     case key(Int32)          // Windows virtual-key code
     case mouseLeft
     case mouseRight
+    /// Travellers Rest helper: toggles stack-transfer mode in inventory, and
+    /// acts as the furniture pickup button while decoration mode is active.
+    /// Kept as a distinct action so the on-screen control can read "ALL"
+    /// instead of the generic right-click "R".
+    case smartAll
     case joystickWASD        // renders as a stick, posts W/A/S/D
     case joystickArrows      // renders as a stick, posts the arrow keys
     case keyboardToggle      // raises the iOS keyboard, as in portrait
@@ -4057,6 +4136,7 @@ enum ControlAction: Codable, Equatable, Hashable {
         case .none:            return "—"
         case .mouseLeft:       return "L"
         case .mouseRight:      return "R"
+        case .smartAll:        return "ALL"
         case .keyboardToggle:  return "⌨"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "↕"
@@ -4085,6 +4165,60 @@ enum ControlAction: Codable, Equatable, Hashable {
             }
             return String(format: "%02X", vk)
         }
+    }
+}
+
+/// Small, explicit state machine for the Travellers Rest touch helpers.
+///
+/// Madeira cannot inspect Unity's private UI hierarchy, so chest windows use
+/// the visible ALL toggle. Inventory opened through the on-screen I control is
+/// tracked automatically. Decoration mode is tracked through the B control.
+/// These modes are mutually exclusive and Escape always returns to ordinary
+/// touch behaviour.
+final class TravellersTouchMode: ObservableObject {
+    static let shared = TravellersTouchMode()
+
+    @Published private(set) var stackTransfer = false
+    @Published private(set) var decoration = false
+    @Published private(set) var furnitureHeld = false
+    private var inventoryOpenedWithI = false
+
+    var allActive: Bool { stackTransfer || furnitureHeld }
+
+    func toggleInventory() {
+        inventoryOpenedWithI.toggle()
+        stackTransfer = inventoryOpenedWithI
+        decoration = false
+        furnitureHeld = false
+    }
+
+    func toggleDecoration() {
+        decoration.toggle()
+        inventoryOpenedWithI = false
+        stackTransfer = false
+        furnitureHeld = false
+    }
+
+    func toggleAll() {
+        guard !decoration else { return }
+        stackTransfer.toggle()
+        inventoryOpenedWithI = false
+        furnitureHeld = false
+    }
+
+    func pickedUpFurniture() {
+        guard decoration else { return }
+        stackTransfer = false
+        furnitureHeld = true
+    }
+
+    func placedFurniture() { furnitureHeld = false }
+
+    func reset() {
+        stackTransfer = false
+        decoration = false
+        furnitureHeld = false
+        inventoryOpenedWithI = false
     }
 }
 
@@ -4591,6 +4725,7 @@ struct TouchControlButton: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
+    @ObservedObject private var travellers = TravellersTouchMode.shared
     @AppStorage(TouchControlStyle.key) private var style = "glass"
     @State private var isDown = false
     @State private var dragBase: CGPoint?
@@ -4602,6 +4737,7 @@ struct TouchControlButton: View {
     private var size: CGSize { TouchControlsModel.size(control) }
     private var isStick: Bool { control.action.stickKeys != nil || control.action.isPadStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
+    private var isAllActive: Bool { control.action == .smartAll && travellers.allActive }
 
     /// The resting outline and the edit-mode selection ring, in the shape the
     /// control actually has.
@@ -4688,15 +4824,17 @@ struct TouchControlButton: View {
                 Text(control.action.label)
                     .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
                                   weight: .medium))
-                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                    .foregroundStyle((isAllActive ? Color.green : Color.white)
+                        .opacity(isDown || isAllActive ? 1.0 : 0.85))
                     .frame(width: size.width, height: size.height)
                     .glassFace(GlassShape(circle: true, solid: solid))
             }
         }
         .frame(width: size.width, height: size.height)
-        .overlay(outline.stroke(.white.opacity(isSelected ? 0.95
-                                               : (isStick ? 0 : 0.28)),
-                                lineWidth: isSelected ? 2 : 1))
+        .overlay(outline.stroke(isAllActive ? Color.green.opacity(0.95)
+                                            : Color.white.opacity(isSelected ? 0.95
+                                                : (isStick ? 0 : 0.28)),
+                                lineWidth: isSelected || isAllActive ? 2 : 1))
         // A stick must not shrink under the thumb; only round buttons do that.
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
         // ml890: no press animation. Pressing the on-screen Enter key killed the
@@ -4748,6 +4886,11 @@ struct TouchControlButton: View {
                         m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
                         m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
                     } else if let q = control.action.stickKeys {
+                        guard !travellers.furnitureHeld else {
+                            applyStick(-1, q)
+                            isDown = false
+                            return
+                        }
                         isDown = true
                         applyStick(snap(v.translation), q)
                     } else if !isDown {
@@ -4823,11 +4966,26 @@ struct TouchControlButton: View {
         }
         switch control.action {
         case .key(let vk):
+            if down {
+                switch vk {
+                case 0x49: travellers.toggleInventory()   // I
+                case 0x42: travellers.toggleDecoration()  // B
+                case 0x1B: travellers.reset()             // Escape
+                default: break
+                }
+            }
             winios_post_key(vk, down ? 1 : 0)
         case .mouseLeft:
             winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
         case .mouseRight:
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .smartAll:
+            if travellers.decoration {
+                winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)
+                if down { travellers.pickedUpFurniture() }
+            } else if down {
+                travellers.toggleAll()
+            }
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
         case .none, .joystickWASD, .joystickArrows:
@@ -4986,7 +5144,7 @@ struct MappingPanel: View {
                 bindingSection
             }
             section("Pointer, sticks & special", [
-                ("L click", .mouseLeft), ("R click", .mouseRight),
+                ("L click", .mouseLeft), ("R click", .mouseRight), ("ALL", .smartAll),
                 ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
                 ("Keyboard", .keyboardToggle), ("None", .none),
             ])

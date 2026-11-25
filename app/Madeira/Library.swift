@@ -4777,6 +4777,7 @@ struct ControllerBindsPage: View {
                 } else {
                     pick(name, "Left click", .mouseLeft)
                     pick(name, "Right click", .mouseRight)
+                    pick(name, "ALL / stack transfer", .smartAll)
                     Menu("Letters") { ForEach(0x41...0x5A, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
                     Menu("Numbers") { ForEach(0x30...0x39, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
                     Menu("Function keys") { ForEach(0...11, id: \.self) { i in pick(name, "F\(i + 1)", .key(Int32(0x70 + i))) } }
@@ -4832,6 +4833,7 @@ struct ControllerBindsPage: View {
         case .none:            return input == "RS" ? "Mouse" : "Nothing"
         case .mouseLeft:       return "Left click"
         case .mouseRight:      return "Right click"
+        case .smartAll:        return "ALL / stack transfer"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "Arrow keys"
         case .keyboardToggle:  return "Show keyboard"
