@@ -245,6 +245,8 @@ final class GestureZoneView: UIView {
         case .mouseRight:
             winios_pointer(0, 0, 0x0008, 0)
             DispatchQueue.main.asyncAfter(deadline: .now() + hold) { winios_pointer(0, 0, 0x0010, 0) }
+        case .smartAll:
+            TravellersTouchMode.shared.toggleAll()
         case .keyboardToggle:
             MetalBackedView.toggleKeyboard()
         case .none, .joystickWASD, .joystickArrows:

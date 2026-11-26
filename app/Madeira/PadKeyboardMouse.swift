@@ -204,6 +204,8 @@ final class PadKeyboardMouse {
             winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
         case .mouseRight:
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .smartAll:
+            if down { TravellersTouchMode.shared.toggleAll() }
         case .keyboardToggle:
             if down { DispatchQueue.main.async { MetalBackedView.toggleKeyboard() } }
         case .none, .joystickWASD, .joystickArrows, .pad:
