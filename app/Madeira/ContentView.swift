@@ -373,16 +373,14 @@ final class MetalBackedView: UIView {
     private var tmGestureDownPoint = CGPoint.zero
     private var tmPeak = 0
     private var tmResolved = false
-    /// A stack-transfer/furniture-pickup long press completed without a held
-    /// mouse button. It still consumes the gesture until every finger lifts.
+    /// A stack-transfer long press completed without a held mouse button. It
+    /// still consumes the gesture until every finger lifts.
     private var tmSpecialResolved = false
     private var tmDragTouch: UITouch?
     private var tmSlopBroken = false
     private var tmGeneration = 0
     private var tmTwoFingerLastY: CGFloat = 0
     private var tmScrollAccum: CGFloat = 0
-    private var furnitureTapTime: TimeInterval = 0
-    private var furnitureTapPoint = CGPoint.zero
     private static let tmHoldDelay: TimeInterval = 0.25
     private static let tmSlop: CGFloat = 10
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
@@ -426,30 +424,19 @@ final class MetalBackedView: UIView {
         postSurfacePointer(x, y, up | F_ABS)
     }
 
-    /// Travellers Rest's decoration mode uses Q (not right-click) to pick up
-    /// the furniture under the cursor.  Keep the key press paired here so a
-    /// long press can never leave Q held when the finger is lifted/cancelled.
-    private func tmFurniturePickup() {
-        winios_post_key(0x51, 1)
-        winios_post_key(0x51, 0)
-    }
-
-    /// Furniture placement deliberately waits for a double tap. The first tap
-    /// only positions the furniture; the second emits one left click and exits
-    /// placement mode, avoiding the game's Q/WASD placement path entirely.
-    private func tmFurnitureTap(at p: CGPoint) {
-        let now = Date().timeIntervalSinceReferenceDate
-        if now - furnitureTapTime < 0.42,
-           hypot(p.x - furnitureTapPoint.x, p.y - furnitureTapPoint.y) < 52 {
-            tmAbsoluteClick(down: F_LDOWN, up: F_LUP, at: p)
-            furnitureTapTime = 0
-            TravellersTouchMode.shared.placedFurniture()
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        } else {
-            furnitureTapTime = now
-            furnitureTapPoint = p
-            UISelectionFeedbackGenerator().selectionChanged()
-        }
+    /// The Travellers Rest action bar occupies the lower-centre strip of the
+    /// 1160x800 guest surface. In decoration mode its item stacks must be
+    /// selected with a click, never dragged: dragging a stack out of a slot
+    /// makes the unused candles/furniture fall out of the action bar.
+    ///
+    /// Use normalised view coordinates so this still matches an M4 iPad when
+    /// the Metal surface is scaled, fitted, or rotated.
+    private func tmDecorationActionBar(_ p: CGPoint) -> Bool {
+        guard TravellersTouchMode.shared.decoration,
+              bounds.width > 0, bounds.height > 0 else { return false }
+        let nx = p.x / bounds.width
+        let ny = p.y / bounds.height
+        return nx >= 0.10 && nx <= 0.84 && ny >= 0.80
     }
 
     /// Travellers Rest uses Q for a second family of contextual interactions,
@@ -479,12 +466,6 @@ final class MetalBackedView: UIView {
             tmGestureDownPoint = t.location(in: self)
             let (x, y) = mapPoint(tmGestureDownPoint)
             winios_cursor_move(x, y)
-            // A carried furniture item follows the cursor immediately. No
-            // button is held: dragging only positions it and double tap places.
-            if TravellersTouchMode.shared.furnitureHeld {
-                tmGeneration += 1
-                return
-            }
             tmGeneration += 1
             let gen = tmGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.tmHoldDelay) { [weak self, weak t] in
@@ -499,16 +480,14 @@ final class MetalBackedView: UIView {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     return
                 }
-                if special.decoration && !special.furnitureHeld {
-                    self.tmResolved = true
-                    self.tmSpecialResolved = true
-                    // The cursor was moved to the finger-down point above.
-                    // Q picks up that exact furniture item in Travellers Rest;
-                    // right-click only selected it and left the game waiting
-                    // for WASD, which made the joystick move the player too.
-                    self.tmFurniturePickup()
-                    special.pickedUpFurniture()
-                    self.furnitureTapTime = 0
+                // A slow press on an action-bar stack remains one clean click.
+                // It must not turn into a held left-button drag.
+                if self.tmDecorationActionBar(self.tmGestureDownPoint) { return }
+                if special.decoration {
+                    // In Travellers Rest, Q/right-click returns placed furniture
+                    // to inventory. Moving existing furniture is a real mouse
+                    // drag: hold left at the highlighted object, move, release.
+                    self.tmCommitDrag(t)
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     return
                 }
@@ -522,15 +501,6 @@ final class MetalBackedView: UIView {
 
     private func touchModeMoved(_ touches: Set<UITouch>, _ event: UIEvent?) {
         let active = activeTouches(event)
-        if TravellersTouchMode.shared.furnitureHeld {
-            guard active.count == 1, let t = touches.first,
-                  let down = tmDownPoints[ObjectIdentifier(t)] else { return }
-            let p = t.location(in: self)
-            if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop { tmSlopBroken = true }
-            let (x, y) = mapPoint(p)
-            winios_cursor_move(x, y)
-            return
-        }
         if !tmResolved, tmDownPoints.count == 2, active.count == 2 {
             let avg = avgPoint(active)
             if tmTwoFingerLastY == 0 { tmTwoFingerLastY = avg.y }
@@ -554,6 +524,10 @@ final class MetalBackedView: UIView {
                 postSurfaceTouchMove(x, y)
                 continue
             }
+            // Ignore finger slop over the decoration action bar. On lift the
+            // original down point is emitted as a single left click, selecting
+            // exactly one placement item instead of pulling out the stack.
+            if tmDecorationActionBar(down) { continue }
             guard tmDownPoints.count == 1 else {
                 if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop { tmSlopBroken = true }
                 continue
@@ -570,14 +544,6 @@ final class MetalBackedView: UIView {
     private func touchModeEnded(_ touches: Set<UITouch>, _ event: UIEvent?) {
         if tmResolved, tmSpecialResolved {
             if activeTouches(event).isEmpty { tmResetGesture() }
-            return
-        }
-        if TravellersTouchMode.shared.furnitureHeld {
-            guard activeTouches(event).isEmpty else { return }
-            let p = touches.first?.location(in: self) ?? tmGestureDownPoint
-            let moved = tmSlopBroken
-            tmResetGesture()
-            if !moved { tmFurnitureTap(at: p) }
             return
         }
         if tmResolved, let d = tmDragTouch, touches.contains(d) {
@@ -604,7 +570,7 @@ final class MetalBackedView: UIView {
     }
 
     private func touchModeCancelled(_ touches: Set<UITouch>) {
-        if tmSpecialResolved || TravellersTouchMode.shared.furnitureHeld {
+        if tmSpecialResolved {
             tmResetGesture()
             return
         }
@@ -4079,8 +4045,7 @@ enum ControlAction: Codable, Equatable, Hashable {
     case key(Int32)          // Windows virtual-key code
     case mouseLeft
     case mouseRight
-    /// Travellers Rest helper: toggles stack-transfer mode in inventory, and
-    /// acts as the furniture pickup button while decoration mode is active.
+    /// Travellers Rest helper: toggles stack-transfer mode in inventory/chests.
     /// Kept as a distinct action so the on-screen control can read "ALL"
     /// instead of the generic right-click "R".
     case smartAll
@@ -4209,47 +4174,34 @@ final class TravellersTouchMode: ObservableObject {
 
     @Published private(set) var stackTransfer = false
     @Published private(set) var decoration = false
-    @Published private(set) var furnitureHeld = false
     private var inventoryOpenedWithI = false
 
-    var allActive: Bool { stackTransfer || furnitureHeld }
+    var allActive: Bool { stackTransfer }
     /// A normal play-surface tap may also answer the game's Q prompt. Never do
     /// that while a tap means stack transfer or furniture manipulation.
-    var contextualQ: Bool { !stackTransfer && !decoration && !furnitureHeld }
+    var contextualQ: Bool { !stackTransfer && !decoration }
 
     func toggleInventory() {
         inventoryOpenedWithI.toggle()
         stackTransfer = inventoryOpenedWithI
         decoration = false
-        furnitureHeld = false
     }
 
     func toggleDecoration() {
         decoration.toggle()
         inventoryOpenedWithI = false
         stackTransfer = false
-        furnitureHeld = false
     }
 
     func toggleAll() {
         guard !decoration else { return }
         stackTransfer.toggle()
         inventoryOpenedWithI = false
-        furnitureHeld = false
     }
-
-    func pickedUpFurniture() {
-        guard decoration else { return }
-        stackTransfer = false
-        furnitureHeld = true
-    }
-
-    func placedFurniture() { furnitureHeld = false }
 
     func reset() {
         stackTransfer = false
         decoration = false
-        furnitureHeld = false
         inventoryOpenedWithI = false
     }
 }
@@ -4918,11 +4870,6 @@ struct TouchControlButton: View {
                         m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
                         m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
                     } else if let q = control.action.stickKeys {
-                        guard !travellers.furnitureHeld else {
-                            applyStick(-1, q)
-                            isDown = false
-                            return
-                        }
                         isDown = true
                         applyStick(snap(v.translation), q)
                     } else if !isDown {
@@ -5002,14 +4949,6 @@ struct TouchControlButton: View {
                 switch vk {
                 case 0x49: travellers.toggleInventory()   // I
                 case 0x42: travellers.toggleDecoration()  // B
-                case 0x51:                                // Q in decoration mode
-                    if travellers.decoration {
-                        if travellers.furnitureHeld {
-                            travellers.placedFurniture()
-                        } else {
-                            travellers.pickedUpFurniture()
-                        }
-                    }
                 case 0x1B: travellers.reset()             // Escape
                 default: break
                 }
@@ -5020,12 +4959,7 @@ struct TouchControlButton: View {
         case .mouseRight:
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
         case .smartAll:
-            if travellers.decoration {
-                winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)
-                if down { travellers.pickedUpFurniture() }
-            } else if down {
-                travellers.toggleAll()
-            }
+            if down { travellers.toggleAll() }
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
         case .none, .joystickWASD, .joystickArrows:
