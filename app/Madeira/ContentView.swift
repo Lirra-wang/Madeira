@@ -426,6 +426,14 @@ final class MetalBackedView: UIView {
         postSurfacePointer(x, y, up | F_ABS)
     }
 
+    /// Travellers Rest's decoration mode uses Q (not right-click) to pick up
+    /// the furniture under the cursor.  Keep the key press paired here so a
+    /// long press can never leave Q held when the finger is lifted/cancelled.
+    private func tmFurniturePickup() {
+        winios_post_key(0x51, 1)
+        winios_post_key(0x51, 0)
+    }
+
     /// Furniture placement deliberately waits for a double tap. The first tap
     /// only positions the furniture; the second emits one left click and exits
     /// placement mode, avoiding the game's Q/WASD placement path entirely.
@@ -494,8 +502,11 @@ final class MetalBackedView: UIView {
                 if special.decoration && !special.furnitureHeld {
                     self.tmResolved = true
                     self.tmSpecialResolved = true
-                    self.tmAbsoluteClick(down: self.F_RDOWN, up: self.F_RUP,
-                                         at: self.tmGestureDownPoint)
+                    // The cursor was moved to the finger-down point above.
+                    // Q picks up that exact furniture item in Travellers Rest;
+                    // right-click only selected it and left the game waiting
+                    // for WASD, which made the joystick move the player too.
+                    self.tmFurniturePickup()
                     special.pickedUpFurniture()
                     self.furnitureTapTime = 0
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -4991,6 +5002,14 @@ struct TouchControlButton: View {
                 switch vk {
                 case 0x49: travellers.toggleInventory()   // I
                 case 0x42: travellers.toggleDecoration()  // B
+                case 0x51:                                // Q in decoration mode
+                    if travellers.decoration {
+                        if travellers.furnitureHeld {
+                            travellers.placedFurniture()
+                        } else {
+                            travellers.pickedUpFurniture()
+                        }
+                    }
                 case 0x1B: travellers.reset()             // Escape
                 default: break
                 }
