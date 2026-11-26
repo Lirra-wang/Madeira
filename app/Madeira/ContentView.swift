@@ -519,10 +519,17 @@ final class MetalBackedView: UIView {
                 // It must not turn into a held left-button drag.
                 if self.tmDecorationActionBar(self.tmGestureDownPoint) { return }
                 if special.decoration {
-                    // In Travellers Rest, Q/right-click returns placed furniture
-                    // to inventory. Moving existing furniture is a real mouse
-                    // drag: hold left at the highlighted object, move, release.
-                    self.tmCommitDrag(t)
+                    // Decoration is keyboard-driven: Q picks up the object
+                    // under the cursor, the carried preview follows ordinary
+                    // cursor motion, and Q places it.  A held left mouse button
+                    // leaves outdoor plots and small furniture permanently in
+                    // the game's "carried" state after the finger lifts.
+                    self.tmResolved = true
+                    self.tmSpecialResolved = true
+                    if !special.decorationCarrying {
+                        self.tmPressKey(0x51)
+                        special.beginDecorationPlacement()
+                    }
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     return
                 }
@@ -536,6 +543,22 @@ final class MetalBackedView: UIView {
 
     private func touchModeMoved(_ touches: Set<UITouch>, _ event: UIEvent?) {
         let active = activeTouches(event)
+        if TravellersTouchMode.shared.decoration, active.count == 1 {
+            // A carried decoration follows the cursor without any mouse button
+            // held. This also makes a long-pressed ground object track the same
+            // finger after Q has picked it up. The lift is deliberately inert;
+            // one later tap performs the explicit Q placement.
+            for t in touches {
+                guard let down = tmDownPoints[ObjectIdentifier(t)] else { continue }
+                let p = t.location(in: self)
+                if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop {
+                    tmSlopBroken = true
+                }
+                let (x, y) = mapPoint(p)
+                winios_cursor_move(x, y)
+            }
+            return
+        }
         if !tmResolved, tmDownPoints.count == 2, active.count == 2 {
             let avg = avgPoint(active)
             if tmTwoFingerLastY == 0 { tmTwoFingerLastY = avg.y }
@@ -596,7 +619,25 @@ final class MetalBackedView: UIView {
         case 1:
             tmLastSingleTapPoint = mid
             tmLastSingleTapTime = Date().timeIntervalSinceReferenceDate
-            if !tmContextualQTap(at: mid) {
+            let travellers = TravellersTouchMode.shared
+            if travellers.decoration, tmDecorationActionBar(mid) {
+                // Select exactly one action-bar item. Tracking it as carried
+                // lets the next playfield tap place one item with Q instead of
+                // dragging the entire candle/furniture stack out of its slot.
+                let (x, y) = mapPoint(mid)
+                postSurfaceTouchDown(x, y)
+                postSurfaceTouchUp(x, y)
+                travellers.beginDecorationPlacement()
+            } else if travellers.decoration, travellers.decorationCarrying {
+                // The cursor already jumped to `mid` at touch-down. Q is the
+                // game's native place command both indoors and on outdoor farm
+                // plots; a mouse click alone leaves the preview attached.
+                tmPressKey(0x51)
+                travellers.finishDecorationPlacement()
+                if TouchControlsModel.shared.hapticsEnabled {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                }
+            } else if !tmContextualQTap(at: mid) {
                 let (x, y) = mapPoint(mid)
                 postSurfaceTouchDown(x, y)
                 postSurfaceTouchUp(x, y)
@@ -4221,6 +4262,11 @@ final class TravellersTouchMode: ObservableObject {
 
     @Published private(set) var stackTransfer = false
     @Published private(set) var decoration = false
+    /// Our best-known copy of Travellers Rest's decoration carry state.  The
+    /// game does not expose its Unity UI hierarchy, so this is advanced only by
+    /// the gestures Madeira itself sends: action-bar click / held Q picks up,
+    /// and the next playfield Q places one item.
+    @Published private(set) var decorationCarrying = false
     private var inventoryOpenedWithI = false
     /// A Q interaction is armed while walking. Once Q opens a contextual
     /// window, subsequent touches must be ordinary UI clicks until movement
@@ -4253,14 +4299,34 @@ final class TravellersTouchMode: ObservableObject {
         inventoryOpenedWithI.toggle()
         stackTransfer = inventoryOpenedWithI
         decoration = false
+        decorationCarrying = false
         contextQArmed = !inventoryOpenedWithI
     }
 
     func toggleDecoration() {
         decoration.toggle()
+        decorationCarrying = false
         inventoryOpenedWithI = false
         stackTransfer = false
         contextQArmed = !decoration
+    }
+
+    func beginDecorationPlacement() {
+        guard decoration else { return }
+        decorationCarrying = true
+    }
+
+    func finishDecorationPlacement() {
+        guard decoration else { return }
+        decorationCarrying = false
+    }
+
+    /// Keeps the visible Q/E button in sync when the player uses it while the
+    /// decoration overlay is open. Outside decoration mode this is a no-op, so
+    /// serving and production retain their existing Q/E behaviour.
+    func noteDecorationQ() {
+        guard decoration else { return }
+        decorationCarrying.toggle()
     }
 
     func toggleAll() {
@@ -4273,6 +4339,7 @@ final class TravellersTouchMode: ObservableObject {
     func reset() {
         stackTransfer = false
         decoration = false
+        decorationCarrying = false
         inventoryOpenedWithI = false
         contextQArmed = true
     }
@@ -4741,6 +4808,7 @@ struct TravellersInteractionButton: View {
     @State private var pressed = false
     @State private var holdingE = false
     @State private var generation = 0
+    @State private var qGeneration = 0
 
     private let holdDelay: TimeInterval = 0.22
     private var diameter: CGFloat { min(104, max(88, screen.height * 0.12)) }
@@ -4787,6 +4855,11 @@ struct TravellersInteractionButton: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + holdDelay) {
             guard pressed, generation == token, !holdingE else { return }
             holdingE = true
+            // Repair a delayed Q-up before starting a held E. This does not
+            // change the control mapping; it only guarantees mutually exclusive
+            // key state after rapid taps or an interrupted system gesture.
+            qGeneration += 1
+            winios_post_key(0x51, 0)
             winios_post_key(0x45, 1)
             fputs("[travellers-touch] interaction button E down\n", stderr)
             if TouchControlsModel.shared.hapticsEnabled {
@@ -4805,8 +4878,17 @@ struct TravellersInteractionButton: View {
             fputs("[travellers-touch] interaction button E up\n", stderr)
         } else {
             TravellersTouchMode.shared.consumeContextQ()
+            TravellersTouchMode.shared.noteDecorationQ()
+            // Release a possibly interrupted E first, then keep Q down long
+            // enough for Unity's next input poll. A generation token prevents
+            // an older rapid tap's delayed key-up from cutting a newer tap short.
+            winios_post_key(0x45, 0)
+            qGeneration += 1
+            let qToken = qGeneration
+            winios_post_key(0x51, 0)
             winios_post_key(0x51, 1)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.11) {
+                guard qGeneration == qToken else { return }
                 winios_post_key(0x51, 0)
             }
             fputs("[travellers-touch] interaction button Q pulse\n", stderr)
@@ -4818,7 +4900,9 @@ struct TravellersInteractionButton: View {
 
     private func cancel() {
         generation += 1
+        qGeneration += 1
         pressed = false
+        winios_post_key(0x51, 0)
         if holdingE {
             winios_post_key(0x45, 0)
             holdingE = false
