@@ -261,7 +261,6 @@ jobs:
     runs-on: xcode-27
     env:
       MADEIRA_PLANNED_SDK: ${{ needs.plan.outputs.sdk }}
-      MADEIRA_PLANNED_IPA: ${{ needs.plan.outputs.ipaenv }}
       MADEIRA_RUNTIME_SDK: ${{ needs.plan.outputs.sdk }}
       MADEIRA_RUNTIME_REUSE: '1'
     timeout-minutes: 360
@@ -271,6 +270,14 @@ jobs:
           submodules: recursive
       - id: sdk
         run: bash tools/build/ci-input-key.sh
+      # xcode-27 is a runner label, not a single immutable image. GitHub may
+      # schedule plan and app on hosts with the same Xcode/iOS SDK but a
+      # different preinstalled Rust toolchain. Native/runtime artifacts remain
+      # guarded by MADEIRA_PLANNED_SDK; scope the complete IPA cache to the app
+      # runner's full fingerprint so a harmless host-image skew cannot abort the
+      # build or poison the plan runner's cache key.
+      - id: appkey
+        run: echo "ipa=ipa-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.ipa }}-$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
       - id: cache-llvm
         uses: actions/cache/restore@v4
         with:
@@ -397,7 +404,7 @@ jobs:
         run: tools/build-ipa.sh
       - uses: actions/cache/save@v4
         with:
-          key: ${{ needs.plan.outputs.ipa }}
+          key: ${{ steps.appkey.outputs.ipa }}
           path: dist/Madeira.ipa
       - uses: actions/upload-artifact@v4
         with:
