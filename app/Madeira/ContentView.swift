@@ -4568,15 +4568,41 @@ struct TouchControlsOverlay: View {
         let buttons = ForEach(m.controls) { c in
             TouchControlButton(control: c, screen: screen)
         }
+        // Travellers Rest uses Q for contextual windows and E for progress
+        // interactions (pouring, serving, cleaning).  A dedicated control is
+        // faster and more deterministic than asking the player to hold an
+        // arbitrary part of the play surface while also aiming the pointer.
+        let showInteraction = session && travellersRestSession && !m.editing
         if #available(iOS 26.0, *) {
             GlassEffectContainer(spacing: 12) {
-                ZStack { buttons }
+                ZStack {
+                    buttons
+                    if showInteraction { TravellersInteractionButton(screen: screen) }
+                }
                     .frame(width: screen.width, height: screen.height, alignment: .topLeading)
             }
             .opacity(opacity)
         } else {
-            buttons.opacity(opacity)
+            ZStack {
+                buttons
+                if showInteraction { TravellersInteractionButton(screen: screen) }
+            }
+            .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+            .opacity(opacity)
         }
+    }
+
+    private var travellersRestSession: Bool {
+        let title: String?
+        if let active = library.activeEntry {
+            title = active.title
+        } else if let id = library.current {
+            title = library.entries.first(where: { $0.id == id })?.title
+        } else {
+            title = nil
+        }
+        let compact = title?.lowercased().filter(\.isLetter)
+        return compact?.contains("travellersrest") == true
     }
 
     private func configureGamepad(landscape: Bool) {
@@ -4702,6 +4728,102 @@ struct TouchControlsOverlay: View {
                 .background(GlassShape(circle: true))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// A visible, low-latency Travellers Rest interaction control.
+///
+/// Tap: Q pulse. Hold for 0.22 s: E stays down until the finger lifts.  The
+/// existing play-surface Q/E gestures remain available; this button is an
+/// unambiguous alternative for serving guests and other timing-sensitive work.
+struct TravellersInteractionButton: View {
+    let screen: CGSize
+    @State private var pressed = false
+    @State private var holdingE = false
+    @State private var generation = 0
+
+    private let holdDelay: TimeInterval = 0.22
+    private var diameter: CGFloat { min(104, max(88, screen.height * 0.12)) }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Image(systemName: holdingE ? "hand.tap.fill" : "hand.tap")
+                .font(.system(size: diameter * 0.27, weight: .semibold))
+            Text(holdingE ? "E" : "Q / E")
+                .font(.system(size: diameter * 0.17, weight: .bold))
+            if !holdingE {
+                Text("点Q · 按E")
+                    .font(.system(size: diameter * 0.105, weight: .medium))
+                    .opacity(0.72)
+            }
+        }
+        .foregroundStyle(holdingE ? Color.green : Color.white)
+        .frame(width: diameter, height: diameter)
+        .glassFace(GlassShape(circle: true,
+                              tint: holdingE ? Color.green : Color.blue,
+                              solid: false))
+        .overlay(Circle().stroke(holdingE ? Color.green.opacity(0.95)
+                                          : Color.white.opacity(0.34),
+                                 lineWidth: holdingE ? 3 : 1))
+        .scaleEffect(pressed ? 0.94 : 1)
+        .position(x: screen.width * 0.84, y: screen.height * 0.79)
+        .contentShape(Circle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in beginIfNeeded() }
+                .onEnded { _ in finish() }
+        )
+        .onDisappear { cancel() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willResignActiveNotification)) { _ in cancel() }
+        .accessibilityLabel("Interaction: tap Q, hold E")
+    }
+
+    private func beginIfNeeded() {
+        guard !pressed else { return }
+        pressed = true
+        generation += 1
+        let token = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + holdDelay) {
+            guard pressed, generation == token, !holdingE else { return }
+            holdingE = true
+            winios_post_key(0x45, 1)
+            fputs("[travellers-touch] interaction button E down\n", stderr)
+            if TouchControlsModel.shared.hapticsEnabled {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
+        }
+    }
+
+    private func finish() {
+        guard pressed else { return }
+        generation += 1
+        pressed = false
+        if holdingE {
+            winios_post_key(0x45, 0)
+            holdingE = false
+            fputs("[travellers-touch] interaction button E up\n", stderr)
+        } else {
+            TravellersTouchMode.shared.consumeContextQ()
+            winios_post_key(0x51, 1)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
+                winios_post_key(0x51, 0)
+            }
+            fputs("[travellers-touch] interaction button Q pulse\n", stderr)
+            if TouchControlsModel.shared.hapticsEnabled {
+                UISelectionFeedbackGenerator().selectionChanged()
+            }
+        }
+    }
+
+    private func cancel() {
+        generation += 1
+        pressed = false
+        if holdingE {
+            winios_post_key(0x45, 0)
+            holdingE = false
+            fputs("[travellers-touch] interaction button E cancelled\n", stderr)
+        }
     }
 }
 
