@@ -444,6 +444,23 @@ final class MetalBackedView: UIView {
         }
     }
 
+    /// Travellers Rest uses Q for a second family of contextual interactions,
+    /// while its ordinary E interaction already accepts the game's left-click
+    /// path. A plain tap on the right half therefore keeps the normal click and
+    /// follows it with one Q press. The click is sent first so a Q-opened window
+    /// never receives the same tap as an accidental UI click.
+    ///
+    /// Inventory/chest transfer and decoration have their own long-press and
+    /// furniture gestures; TravellersTouchMode disables contextual Q there.
+    private func tmContextualQIfNeeded(at p: CGPoint) {
+        guard p.x >= bounds.midX, TravellersTouchMode.shared.contextualQ else { return }
+        winios_post_key(0x51, 1)
+        winios_post_key(0x51, 0)
+        if TouchControlsModel.shared.hapticsEnabled {
+            UISelectionFeedbackGenerator().selectionChanged()
+        }
+    }
+
     private func touchModeBegan(_ touches: Set<UITouch>) {
         guard !tmResolved else { return }   // a finger joining mid-drag changes nothing
         for t in touches where tmDownPoints[ObjectIdentifier(t)] == nil {
@@ -568,6 +585,7 @@ final class MetalBackedView: UIView {
             let (x, y) = mapPoint(mid)
             postSurfaceTouchDown(x, y)
             postSurfaceTouchUp(x, y)
+            tmContextualQIfNeeded(at: mid)
         case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
         case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
         default: break
@@ -4184,6 +4202,9 @@ final class TravellersTouchMode: ObservableObject {
     private var inventoryOpenedWithI = false
 
     var allActive: Bool { stackTransfer || furnitureHeld }
+    /// A normal play-surface tap may also answer the game's Q prompt. Never do
+    /// that while a tap means stack transfer or furniture manipulation.
+    var contextualQ: Bool { !stackTransfer && !decoration && !furnitureHeld }
 
     func toggleInventory() {
         inventoryOpenedWithI.toggle()
