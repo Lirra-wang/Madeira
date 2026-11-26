@@ -377,6 +377,10 @@ final class MetalBackedView: UIView {
     /// still consumes the gesture until every finger lifts.
     private var tmSpecialResolved = false
     private var tmDragTouch: UITouch?
+    /// Contextual E must remain down for the entire finger hold. Travellers
+    /// Rest uses this for pulling a drink from a tap; a short key pulse does
+    /// not complete the progress action.
+    private var tmHeldKey: Int32?
     private var tmSlopBroken = false
     private var tmGeneration = 0
     private var tmTwoFingerLastY: CGFloat = 0
@@ -394,6 +398,11 @@ final class MetalBackedView: UIView {
     private var touchPointerMode: Bool { InputSettings.shared.touchMode }
 
     private func tmResetGesture() {
+        if let vk = tmHeldKey {
+            winios_post_key(vk, 0)
+            fputs("[travellers-touch] held key up vk=\(vk)\n", stderr)
+            tmHeldKey = nil
+        }
         tmDownPoints.removeAll()
         tmGestureDownPoint = .zero
         tmPeak = 0
@@ -495,13 +504,14 @@ final class MetalBackedView: UIView {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     return
                 }
-                if self.tmGestureDownPoint.x >= self.bounds.midX, special.contextualQ {
-                    // A held right-side interaction is E, not a mouse drag.
-                    // This is used for pouring/collecting actions that need E
-                    // while a quick tap on the same area remains Q.
+                if self.tmGestureDownPoint.x >= self.bounds.midX, special.contextualE {
+                    // Pulling a drink is a progress action: E must stay down
+                    // from the hold threshold until the finger actually lifts.
                     self.tmResolved = true
                     self.tmSpecialResolved = true
-                    self.tmPressKey(0x45)
+                    self.tmHeldKey = 0x45
+                    winios_post_key(0x45, 1)
+                    fputs("[travellers-touch] held E down\n", stderr)
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     return
                 }
@@ -4221,6 +4231,10 @@ final class TravellersTouchMode: ObservableObject {
     /// A normal play-surface tap may also answer the game's Q prompt. Never do
     /// that while a tap means stack transfer or furniture manipulation.
     var contextualQ: Bool { contextQArmed && !stackTransfer && !decoration }
+    /// E is a hold interaction in the world (for example pouring a drink).
+    /// It remains available after Q opens a dispenser so the player can pour
+    /// without having to walk away merely to re-arm the gesture.
+    var contextualE: Bool { !stackTransfer && !decoration }
 
     func consumeContextQ() { contextQArmed = false }
 
