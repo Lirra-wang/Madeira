@@ -381,8 +381,14 @@ final class MetalBackedView: UIView {
     private var tmGeneration = 0
     private var tmTwoFingerLastY: CGFloat = 0
     private var tmScrollAccum: CGFloat = 0
+    /// A two-finger stack gesture is easier on glass if it operates on the
+    /// item the player just tapped, rather than the geometric midpoint between
+    /// two fingertips (which is often an empty inventory cell).
+    private var tmLastSingleTapPoint: CGPoint?
+    private var tmLastSingleTapTime: TimeInterval = 0
     private static let tmHoldDelay: TimeInterval = 0.25
     private static let tmSlop: CGFloat = 10
+    private static let tmRecentTargetWindow: TimeInterval = 1.25
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
 
     private var touchPointerMode: Bool { InputSettings.shared.touchMode }
@@ -439,21 +445,30 @@ final class MetalBackedView: UIView {
         return nx >= 0.10 && nx <= 0.84 && ny >= 0.80
     }
 
-    /// Travellers Rest uses Q for a second family of contextual interactions,
-    /// while its ordinary E interaction already accepts the game's left-click
-    /// path. A plain tap on the right half therefore keeps the normal click and
-    /// follows it with one Q press. The click is sent first so a Q-opened window
-    /// never receives the same tap as an accidental UI click.
-    ///
-    /// Inventory/chest transfer and decoration have their own long-press and
-    /// furniture gestures; TravellersTouchMode disables contextual Q there.
-    private func tmContextualQIfNeeded(at p: CGPoint) {
-        guard p.x >= bounds.midX, TravellersTouchMode.shared.contextualQ else { return }
-        winios_post_key(0x51, 1)
-        winios_post_key(0x51, 0)
+    /// Unity polls keyboard state once per frame. Posting DOWN and UP in the
+    /// same run-loop turn can therefore disappear between frames, especially
+    /// while the game is loading a save. Keep contextual keys down briefly.
+    private func tmPressKey(_ vk: Int32) {
+        winios_post_key(vk, 1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
+            winios_post_key(vk, 0)
+        }
+    }
+
+    /// In normal play the right half is the contextual interaction pad:
+    /// quick tap = Q, hold = E. Q is consumed until the player moves again, so
+    /// a window opened by Q immediately returns to ordinary mouse/UI clicks.
+    /// Inventory transfer and decoration keep their specialised gestures.
+    @discardableResult
+    private func tmContextualQTap(at p: CGPoint) -> Bool {
+        let mode = TravellersTouchMode.shared
+        guard p.x >= bounds.midX, mode.contextualQ else { return false }
+        mode.consumeContextQ()
+        tmPressKey(0x51)
         if TouchControlsModel.shared.hapticsEnabled {
             UISelectionFeedbackGenerator().selectionChanged()
         }
+        return true
     }
 
     private func touchModeBegan(_ touches: Set<UITouch>) {
@@ -477,6 +492,16 @@ final class MetalBackedView: UIView {
                     self.tmSpecialResolved = true
                     self.tmAbsoluteClick(down: self.F_RDOWN, up: self.F_RUP,
                                          at: self.tmGestureDownPoint)
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    return
+                }
+                if self.tmGestureDownPoint.x >= self.bounds.midX, special.contextualQ {
+                    // A held right-side interaction is E, not a mouse drag.
+                    // This is used for pouring/collecting actions that need E
+                    // while a quick tap on the same area remains Q.
+                    self.tmResolved = true
+                    self.tmSpecialResolved = true
+                    self.tmPressKey(0x45)
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     return
                 }
@@ -559,11 +584,23 @@ final class MetalBackedView: UIView {
         guard !brokeSlop else { return }
         switch peak {
         case 1:
-            let (x, y) = mapPoint(mid)
-            postSurfaceTouchDown(x, y)
-            postSurfaceTouchUp(x, y)
-            tmContextualQIfNeeded(at: mid)
-        case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
+            tmLastSingleTapPoint = mid
+            tmLastSingleTapTime = Date().timeIntervalSinceReferenceDate
+            if !tmContextualQTap(at: mid) {
+                let (x, y) = mapPoint(mid)
+                postSurfaceTouchDown(x, y)
+                postSurfaceTouchUp(x, y)
+            }
+        case 2:
+            let now = Date().timeIntervalSinceReferenceDate
+            let target: CGPoint
+            if let recent = tmLastSingleTapPoint,
+               now - tmLastSingleTapTime <= Self.tmRecentTargetWindow {
+                target = recent
+            } else {
+                target = mid
+            }
+            tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: target)
         case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
         default: break
         }
@@ -4175,34 +4212,55 @@ final class TravellersTouchMode: ObservableObject {
     @Published private(set) var stackTransfer = false
     @Published private(set) var decoration = false
     private var inventoryOpenedWithI = false
+    /// A Q interaction is armed while walking. Once Q opens a contextual
+    /// window, subsequent touches must be ordinary UI clicks until movement
+    /// proves the player has returned to the world.
+    private var contextQArmed = true
 
     var allActive: Bool { stackTransfer }
     /// A normal play-surface tap may also answer the game's Q prompt. Never do
     /// that while a tap means stack transfer or furniture manipulation.
-    var contextualQ: Bool { !stackTransfer && !decoration }
+    var contextualQ: Bool { contextQArmed && !stackTransfer && !decoration }
+
+    func consumeContextQ() { contextQArmed = false }
+
+    /// Movement is a reliable indication that an inventory/context window is
+    /// no longer owning input. It also repairs stale mode state after loading a
+    /// different save or closing inventory through the game's own UI.
+    func noteMovement() {
+        contextQArmed = true
+        if stackTransfer {
+            stackTransfer = false
+            inventoryOpenedWithI = false
+        }
+    }
 
     func toggleInventory() {
         inventoryOpenedWithI.toggle()
         stackTransfer = inventoryOpenedWithI
         decoration = false
+        contextQArmed = !inventoryOpenedWithI
     }
 
     func toggleDecoration() {
         decoration.toggle()
         inventoryOpenedWithI = false
         stackTransfer = false
+        contextQArmed = !decoration
     }
 
     func toggleAll() {
         guard !decoration else { return }
         stackTransfer.toggle()
         inventoryOpenedWithI = false
+        contextQArmed = !stackTransfer
     }
 
     func reset() {
         stackTransfer = false
         decoration = false
         inventoryOpenedWithI = false
+        contextQArmed = true
     }
 }
 
@@ -4928,6 +4986,7 @@ struct TouchControlButton: View {
     /// wanders inside one sector.
     private func applyStick(_ next: Int, _ q: [Int32]) {
         guard next != stickDir else { return }
+        if next != -1 { travellers.noteMovement() }
         let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
         for vk in old.subtracting(new) { winios_post_key(vk, 0) }
         for vk in new.subtracting(old) { winios_post_key(vk, 1) }
